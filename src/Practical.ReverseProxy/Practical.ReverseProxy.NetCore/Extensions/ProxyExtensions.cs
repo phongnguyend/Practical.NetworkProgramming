@@ -1,22 +1,21 @@
-﻿using Microsoft.AspNetCore.Http;
-using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Http;
 using System;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
 using System.Threading.Tasks;
 
-namespace Practical.ReverseProxy.NetCore.Controllers;
+namespace Practical.ReverseProxy.NetCore.Extensions;
 
-public class ProxyController : Controller
+public static class ProxyExtensions
 {
     private const int StreamCopyBufferSize = 81920;
 
-    private static HttpClient _httpClient = new HttpClient();
+    private static readonly HttpClient _httpClient = new HttpClient();
 
-    private HttpRequestMessage CloneRequest(Uri uri)
+    private static HttpRequestMessage CloneRequest(this HttpContext httpContext, Uri uri)
     {
-        var request = HttpContext.Request;
+        var request = httpContext.Request;
 
         var requestMessage = new HttpRequestMessage();
         var requestMethod = request.Method;
@@ -30,7 +29,6 @@ public class ProxyController : Controller
             requestMessage.Content = streamContent;
         }
 
-        // Copy the request headers
         foreach (var header in request.Headers)
         {
             if (!requestMessage.Headers.TryAddWithoutValidation(header.Key, header.Value.ToArray()) && requestMessage.Content != null)
@@ -46,9 +44,9 @@ public class ProxyController : Controller
         return requestMessage;
     }
 
-    private async Task ForwardResponseAsync(HttpResponseMessage httpResponseMessage)
+    private static async Task ForwardResponseAsync(this HttpContext httpContext, HttpResponseMessage httpResponseMessage)
     {
-        var response = HttpContext.Response;
+        var response = httpContext.Response;
 
         response.StatusCode = (int)httpResponseMessage.StatusCode;
 
@@ -62,17 +60,16 @@ public class ProxyController : Controller
             response.Headers[header.Key] = header.Value.ToArray();
         }
 
-        // SendAsync removes chunking from the response. This removes the header so it doesn't expect a chunked response.
         response.Headers.Remove("transfer-encoding");
 
         using var responseStream = await httpResponseMessage.Content.ReadAsStreamAsync();
-        await responseStream.CopyToAsync(response.Body, StreamCopyBufferSize, HttpContext.RequestAborted);
+        await responseStream.CopyToAsync(response.Body, StreamCopyBufferSize, httpContext.RequestAborted);
     }
 
-    protected async Task SendAsync(string url)
+    public static async Task ProxyAsync(this HttpContext httpContext, string url)
     {
-        var request = CloneRequest(new Uri(url));
+        var request = httpContext.CloneRequest(new Uri(url));
         var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
-        await ForwardResponseAsync(response);
+        await httpContext.ForwardResponseAsync(response);
     }
 }
