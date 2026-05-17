@@ -1,3 +1,4 @@
 <Solution>
   <Project Path="Practical.DnsClient/Practical.DnsClient.csproj" />
+  <Project Path="Practical.DnsServer/Practical.DnsServer.csproj" Id="5a3d4ea9-b379-40b3-9236-2c1fe1b5cef7" />
 </Solution>
