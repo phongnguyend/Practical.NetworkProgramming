@@ -18,6 +18,7 @@ Console.CancelKeyPress += (_, eventArgs) =>
 
 var server = new SimpleHttpServer(IPAddress.Any, port);
 Console.WriteLine($"HTTP server listening on http://localhost:{port}/");
+Console.WriteLine($"WebSocket echo endpoint: ws://localhost:{port}/ws");
 Console.WriteLine("Press Ctrl+C to stop.");
 
 await server.RunAsync(cancellation.Token);

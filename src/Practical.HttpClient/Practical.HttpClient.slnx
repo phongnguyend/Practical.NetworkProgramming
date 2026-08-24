@@ -1,4 +1,5 @@
 <Solution>
   <Project Path="Practical.HttpClient/Practical.HttpClient.csproj" />
   <Project Path="Practical.HttpServer/Practical.HttpServer.csproj" />
+  <Project Path="Practical.WebSocketClient/Practical.WebSocketClient.csproj" />
 </Solution>

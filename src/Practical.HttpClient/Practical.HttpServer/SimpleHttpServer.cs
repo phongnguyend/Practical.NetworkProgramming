@@ -1,5 +1,7 @@
 using System.Net;
 using System.Net.Sockets;
+using System.Net.WebSockets;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
@@ -10,6 +12,8 @@ public sealed class SimpleHttpServer(IPAddress address, int port)
 {
     private const int MaximumHeaderSize = 64 * 1024;
     private const int MaximumBodySize = 10 * 1024 * 1024;
+    private const int MaximumWebSocketMessageSize = 1024 * 1024;
+    private const string WebSocketGuid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
     private static readonly HashSet<string> AllowedMethods =
         new(StringComparer.Ordinal) { "GET", "POST", "PUT", "DELETE" };
 
@@ -85,6 +89,12 @@ public sealed class SimpleHttpServer(IPAddress address, int port)
             return;
         }
 
+        if (IsWebSocketAttempt(request.Headers))
+        {
+            await HandleWebSocketUpgradeAsync(stream, request, cancellationToken);
+            return;
+        }
+
         if (!AllowedMethods.Contains(request.Method))
         {
             await WriteErrorAsync(
@@ -138,6 +148,157 @@ public sealed class SimpleHttpServer(IPAddress address, int port)
 
         byte[] body = JsonSerializer.SerializeToUtf8Bytes(response, JsonOptions);
         await WriteResponseAsync(stream, 200, "OK", body, cancellationToken);
+    }
+
+    private static bool IsWebSocketAttempt(IReadOnlyDictionary<string, string> headers) =>
+        HeaderContainsToken(headers, "Upgrade", "websocket") ||
+        headers.ContainsKey("Sec-WebSocket-Key");
+
+    private static async Task HandleWebSocketUpgradeAsync(
+        NetworkStream stream,
+        ParsedRequest request,
+        CancellationToken cancellationToken)
+    {
+        if (request.Path != "/ws")
+        {
+            await WriteErrorAsync(stream, 404, "Not Found", "The WebSocket endpoint is /ws.", cancellationToken);
+            return;
+        }
+
+        if (request.Method != "GET" || request.Version != "HTTP/1.1")
+        {
+            await WriteErrorAsync(
+                stream,
+                400,
+                "Bad Request",
+                "A WebSocket upgrade requires GET and HTTP/1.1.",
+                cancellationToken);
+            return;
+        }
+
+        if (!HeaderContainsToken(request.Headers, "Connection", "Upgrade") ||
+            !HeaderContainsToken(request.Headers, "Upgrade", "websocket"))
+        {
+            await WriteErrorAsync(
+                stream,
+                400,
+                "Bad Request",
+                "Connection: Upgrade and Upgrade: websocket headers are required.",
+                cancellationToken);
+            return;
+        }
+
+        if (!request.Headers.TryGetValue("Sec-WebSocket-Version", out string? version) || version != "13")
+        {
+            await WriteErrorAsync(
+                stream,
+                426,
+                "Upgrade Required",
+                "Only WebSocket version 13 is supported.",
+                cancellationToken,
+                "Sec-WebSocket-Version: 13\r\n");
+            return;
+        }
+
+        if (!request.Headers.TryGetValue("Sec-WebSocket-Key", out string? key) || !IsValidWebSocketKey(key))
+        {
+            await WriteErrorAsync(
+                stream,
+                400,
+                "Bad Request",
+                "Sec-WebSocket-Key must be a Base64-encoded 16-byte value.",
+                cancellationToken);
+            return;
+        }
+
+        string accept = Convert.ToBase64String(
+            SHA1.HashData(Encoding.ASCII.GetBytes(key.Trim() + WebSocketGuid)));
+        string response =
+            "HTTP/1.1 101 Switching Protocols\r\n" +
+            "Upgrade: websocket\r\n" +
+            "Connection: Upgrade\r\n" +
+            $"Sec-WebSocket-Accept: {accept}\r\n\r\n";
+
+        await stream.WriteAsync(Encoding.ASCII.GetBytes(response), cancellationToken);
+
+        using WebSocket webSocket = WebSocket.CreateFromStream(
+            stream,
+            isServer: true,
+            subProtocol: null,
+            keepAliveInterval: TimeSpan.FromSeconds(30));
+
+        await RunWebSocketEchoLoopAsync(webSocket, cancellationToken);
+    }
+
+    private static bool HeaderContainsToken(
+        IReadOnlyDictionary<string, string> headers,
+        string headerName,
+        string token) =>
+        headers.TryGetValue(headerName, out string? value) &&
+        value.Split(',').Any(part => part.Trim().Equals(token, StringComparison.OrdinalIgnoreCase));
+
+    private static bool IsValidWebSocketKey(string key)
+    {
+        try
+        {
+            return Convert.FromBase64String(key.Trim()).Length == 16;
+        }
+        catch (FormatException)
+        {
+            return false;
+        }
+    }
+
+    private static async Task RunWebSocketEchoLoopAsync(
+        WebSocket webSocket,
+        CancellationToken cancellationToken)
+    {
+        var receiveBuffer = new byte[8192];
+
+        try
+        {
+            while (webSocket.State == WebSocketState.Open)
+            {
+                using var message = new MemoryStream();
+                WebSocketReceiveResult result;
+
+                do
+                {
+                    result = await webSocket.ReceiveAsync(receiveBuffer, cancellationToken);
+
+                    if (result.MessageType == WebSocketMessageType.Close)
+                    {
+                        await webSocket.CloseOutputAsync(
+                            result.CloseStatus ?? WebSocketCloseStatus.NormalClosure,
+                            result.CloseStatusDescription,
+                            cancellationToken);
+                        return;
+                    }
+
+                    if (message.Length + result.Count > MaximumWebSocketMessageSize)
+                    {
+                        await webSocket.CloseOutputAsync(
+                            WebSocketCloseStatus.MessageTooBig,
+                            $"Messages cannot exceed {MaximumWebSocketMessageSize} bytes.",
+                            cancellationToken);
+                        return;
+                    }
+
+                    await message.WriteAsync(receiveBuffer.AsMemory(0, result.Count), cancellationToken);
+                }
+                while (!result.EndOfMessage);
+
+                await webSocket.SendAsync(
+                    message.GetBuffer().AsMemory(0, checked((int)message.Length)),
+                    result.MessageType,
+                    endOfMessage: true,
+                    cancellationToken);
+            }
+        }
+        catch (WebSocketException)
+        {
+            // The peer disconnected without completing the close handshake.
+        }
     }
 
     private static async Task<string?> ReadHeadersAsync(NetworkStream stream, CancellationToken cancellationToken)
@@ -218,7 +379,7 @@ public sealed class SimpleHttpServer(IPAddress address, int port)
                 : value;
         }
 
-        request = new ParsedRequest(method, path, queryString, headers);
+        request = new ParsedRequest(method, requestLine[2], path, queryString, headers);
         return true;
     }
 
@@ -306,6 +467,7 @@ public sealed class SimpleHttpServer(IPAddress address, int port)
 
     private sealed record ParsedRequest(
         string Method,
+        string Version,
         string Path,
         string QueryString,
         Dictionary<string, string> Headers);
