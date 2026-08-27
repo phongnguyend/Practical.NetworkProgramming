@@ -124,39 +124,43 @@ public sealed class SimpleHttpServer(IPAddress address, int port)
             return;
         }
 
-        if (contentLength > 0)
-        {
-            try
-            {
-                await DrainBodyAsync(stream, contentLength, cancellationToken);
-            }
-            catch (EndOfStreamException exception)
-            {
-                await WriteErrorAsync(stream, 400, "Bad Request", exception.Message, cancellationToken);
-                return;
-            }
-        }
+        Stream requestBody = contentLength == 0
+            ? Stream.Null
+            : new ContentLengthReadStream(stream, contentLength);
+        request.SetBody(requestBody);
 
         var remoteEndPoint = client.Client.RemoteEndPoint as IPEndPoint;
         var response = new ClientInformation(
             request.Method,
-            request.Headers.GetValueOrDefault("Host") ?? string.Empty,
+            request.Headers.Host ?? string.Empty,
             remoteEndPoint?.Address.ToString() ?? string.Empty,
             request.Path,
             request.QueryString,
-            request.Headers);
+            request.Headers,
+            request.Content.Length ?? 0);
 
-        byte[] body = JsonSerializer.SerializeToUtf8Bytes(response, JsonOptions);
-        await WriteResponseAsync(stream, 200, "OK", body, cancellationToken);
+        if (request.Headers.ContainsToken("Expect", "100-continue") && contentLength > 0)
+            await stream.WriteAsync("HTTP/1.1 100 Continue\r\n\r\n"u8.ToArray(), cancellationToken);
+
+        try
+        {
+            await request.Content.CopyToAsync(Stream.Null, cancellationToken);
+        }
+        catch (EndOfStreamException exception)
+        {
+            await WriteErrorAsync(stream, 400, "Bad Request", exception.Message, cancellationToken);
+            return;
+        }
+
+        await WriteJsonResponseAsync(stream, 200, "OK", response, cancellationToken);
     }
 
-    private static bool IsWebSocketAttempt(IReadOnlyDictionary<string, string> headers) =>
-        HeaderContainsToken(headers, "Upgrade", "websocket") ||
-        headers.ContainsKey("Sec-WebSocket-Key");
+    private static bool IsWebSocketAttempt(SimpleHttpHeaders headers) =>
+        headers.ContainsToken("Upgrade", "websocket") || headers.WebSocketKey is not null;
 
     private static async Task HandleWebSocketUpgradeAsync(
         NetworkStream stream,
-        ParsedRequest request,
+        SimpleHttpRequest request,
         CancellationToken cancellationToken)
     {
         if (request.Path != "/ws")
@@ -176,8 +180,8 @@ public sealed class SimpleHttpServer(IPAddress address, int port)
             return;
         }
 
-        if (!HeaderContainsToken(request.Headers, "Connection", "Upgrade") ||
-            !HeaderContainsToken(request.Headers, "Upgrade", "websocket"))
+        if (!request.Headers.ContainsToken("Connection", "Upgrade") ||
+            !request.Headers.ContainsToken("Upgrade", "websocket"))
         {
             await WriteErrorAsync(
                 stream,
@@ -188,7 +192,7 @@ public sealed class SimpleHttpServer(IPAddress address, int port)
             return;
         }
 
-        if (!request.Headers.TryGetValue("Sec-WebSocket-Version", out string? version) || version != "13")
+        if (request.Headers.WebSocketVersion != "13")
         {
             await WriteErrorAsync(
                 stream,
@@ -200,7 +204,7 @@ public sealed class SimpleHttpServer(IPAddress address, int port)
             return;
         }
 
-        if (!request.Headers.TryGetValue("Sec-WebSocket-Key", out string? key) || !IsValidWebSocketKey(key))
+        if (request.Headers.WebSocketKey is not string key || !IsValidWebSocketKey(key))
         {
             await WriteErrorAsync(
                 stream,
@@ -229,13 +233,6 @@ public sealed class SimpleHttpServer(IPAddress address, int port)
 
         await RunWebSocketEchoLoopAsync(webSocket, cancellationToken);
     }
-
-    private static bool HeaderContainsToken(
-        IReadOnlyDictionary<string, string> headers,
-        string headerName,
-        string token) =>
-        headers.TryGetValue(headerName, out string? value) &&
-        value.Split(',').Any(part => part.Trim().Equals(token, StringComparison.OrdinalIgnoreCase));
 
     private static bool IsValidWebSocketKey(string key)
     {
@@ -332,7 +329,7 @@ public sealed class SimpleHttpServer(IPAddress address, int port)
         throw new InvalidDataException($"Request headers cannot exceed {MaximumHeaderSize} bytes.");
     }
 
-    private static bool TryParseRequest(string rawHeaders, out ParsedRequest request, out string error)
+    private static bool TryParseRequest(string rawHeaders, out SimpleHttpRequest request, out string error)
     {
         request = default!;
         error = string.Empty;
@@ -379,55 +376,43 @@ public sealed class SimpleHttpServer(IPAddress address, int port)
                 : value;
         }
 
-        request = new ParsedRequest(method, requestLine[2], path, queryString, headers);
+        request = new SimpleHttpRequest(
+            method,
+            requestLine[2],
+            path,
+            queryString,
+            new SimpleHttpHeaders(headers));
         return true;
     }
 
     private static bool TryGetContentLength(
-        IReadOnlyDictionary<string, string> headers,
+        SimpleHttpHeaders headers,
         out int contentLength,
         out string error)
     {
         contentLength = 0;
         error = string.Empty;
 
-        if (headers.ContainsKey("Transfer-Encoding"))
+        if (headers.TransferEncoding.Count > 0)
         {
             error = "Transfer-Encoding is not supported; send a Content-Length header instead.";
             return false;
         }
 
-        if (!headers.TryGetValue("Content-Length", out string? value))
+        if (!headers.ContainsKey("Content-Length"))
             return true;
 
-        if (!int.TryParse(value, out contentLength) || contentLength < 0)
+        if (headers.ContentLength is not long parsedContentLength || parsedContentLength > int.MaxValue)
         {
             error = "Content-Length must be a non-negative integer.";
             return false;
         }
 
+        contentLength = (int)parsedContentLength;
         return true;
     }
 
-    private static async Task DrainBodyAsync(
-        NetworkStream stream,
-        int contentLength,
-        CancellationToken cancellationToken)
-    {
-        var buffer = new byte[Math.Min(contentLength, 8192)];
-        int remaining = contentLength;
-
-        while (remaining > 0)
-        {
-            int read = await stream.ReadAsync(buffer.AsMemory(0, Math.Min(remaining, buffer.Length)), cancellationToken);
-            if (read == 0)
-                throw new EndOfStreamException("The request body ended before Content-Length bytes were received.");
-
-            remaining -= read;
-        }
-    }
-
-    private static Task WriteErrorAsync(
+    private static async Task WriteErrorAsync(
         NetworkStream stream,
         int statusCode,
         string reasonPhrase,
@@ -435,27 +420,34 @@ public sealed class SimpleHttpServer(IPAddress address, int port)
         CancellationToken cancellationToken,
         string additionalHeaders = "")
     {
-        byte[] body = JsonSerializer.SerializeToUtf8Bytes(new { error = message }, JsonOptions);
-        return WriteResponseAsync(stream, statusCode, reasonPhrase, body, cancellationToken, additionalHeaders);
+        await WriteJsonResponseAsync(
+            stream,
+            statusCode,
+            reasonPhrase,
+            new { error = message },
+            cancellationToken,
+            additionalHeaders);
     }
 
-    private static async Task WriteResponseAsync(
+    private static async Task WriteJsonResponseAsync<T>(
         NetworkStream stream,
         int statusCode,
         string reasonPhrase,
-        byte[] body,
+        T body,
         CancellationToken cancellationToken,
         string additionalHeaders = "")
     {
         string headers =
             $"HTTP/1.1 {statusCode} {reasonPhrase}\r\n" +
             "Content-Type: application/json; charset=utf-8\r\n" +
-            $"Content-Length: {body.Length}\r\n" +
+            "Transfer-Encoding: chunked\r\n" +
             additionalHeaders +
             "Connection: close\r\n\r\n";
 
         await stream.WriteAsync(Encoding.ASCII.GetBytes(headers), cancellationToken);
-        await stream.WriteAsync(body, cancellationToken);
+        var content = new ChunkedWriteStream(stream);
+        await JsonSerializer.SerializeAsync(content, body, JsonOptions, cancellationToken);
+        await content.CompleteAsync(cancellationToken);
     }
 
     private static readonly JsonSerializerOptions JsonOptions = new()
@@ -465,18 +457,12 @@ public sealed class SimpleHttpServer(IPAddress address, int port)
         WriteIndented = true
     };
 
-    private sealed record ParsedRequest(
-        string Method,
-        string Version,
-        string Path,
-        string QueryString,
-        Dictionary<string, string> Headers);
-
     private sealed record ClientInformation(
         string Method,
         string Host,
         string Ip,
         string Path,
         string QueryString,
-        IReadOnlyDictionary<string, string> Headers);
+        IReadOnlyDictionary<string, string> Headers,
+        long BodyLength);
 }
