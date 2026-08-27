@@ -1,4 +1,6 @@
 ﻿using Practical.HttpClient;
+using System.Net.Http.Headers;
+using System.Text;
 
 var client = new SimpleHttpClient(new SimpleHttpClientOptions
 {
@@ -19,3 +21,19 @@ foreach (var header in response2.Headers)
     Console.WriteLine($"{header.Key}: {header.Value}");
 }
 await response2.SaveContentToFileAsync("CryptographyHelper.zip");
+
+Console.WriteLine();
+
+using var form = new MultipartFormDataContent();
+using var fileContent = new ByteArrayContent(Encoding.UTF8.GetBytes("Test file content"));
+fileContent.Headers.ContentType = MediaTypeHeaderValue.Parse("multipart/form-data");
+form.Add(fileContent, "file", "abc.txt");
+form.Add(new StringContent("Test Name"), "name");
+
+var response3 = await client.PostAsync($"http://localhost:8000/convert", form);
+foreach (var header in response3.Headers)
+{
+    Console.WriteLine($"{header.Key}: {header.Value}");
+}
+Console.WriteLine(await response3.ReadAsStringAsync());
+

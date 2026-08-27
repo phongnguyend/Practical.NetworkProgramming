@@ -16,45 +16,67 @@ public class SimpleHttpClient
     public Task<SimpleHttpResponse> GetAsync(
         string url,
         CancellationToken cancellationToken = default)
-        => SendAsync("GET", url, cancellationToken: cancellationToken);
+        => SendAsync("GET", url, null, cancellationToken);
 
     public Task<SimpleHttpResponse> PostAsync(
         string url,
-        string? body = null,
-        string contentType = "application/json",
+        HttpContent content,
         CancellationToken cancellationToken = default)
-        => SendAsync("POST", url, body, contentType, cancellationToken);
+    {
+        ArgumentNullException.ThrowIfNull(content);
+        return SendAsync("POST", url, content, cancellationToken);
+    }
 
     public Task<SimpleHttpResponse> PutAsync(
         string url,
-        string? body = null,
-        string contentType = "application/json",
+        HttpContent content,
         CancellationToken cancellationToken = default)
-        => SendAsync("PUT", url, body, contentType, cancellationToken);
+    {
+        ArgumentNullException.ThrowIfNull(content);
+        return SendAsync("PUT", url, content, cancellationToken);
+    }
 
     public Task<SimpleHttpResponse> DeleteAsync(
         string url,
         CancellationToken cancellationToken = default)
-        => SendAsync("DELETE", url, cancellationToken: cancellationToken);
+        => SendAsync("DELETE", url, null, cancellationToken);
 
     private async Task<SimpleHttpResponse> SendAsync(
         string method,
         string url,
-        string? body = null,
-        string contentType = "application/json",
-        CancellationToken cancellationToken = default)
+        HttpContent? content,
+        CancellationToken cancellationToken)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(url);
 
         var uri = new Uri(url, UriKind.Absolute);
+        Stream? contentStream = content is null
+            ? null
+            : await content.ReadAsStreamAsync(cancellationToken);
+        long initialPosition = contentStream?.CanSeek == true ? contentStream.Position : 0;
+        bool sendContent = content is not null;
+        bool contentSent = false;
+
         for (int redirectCount = 0; ; redirectCount++)
         {
+            if (sendContent && contentSent)
+            {
+                if (contentStream?.CanSeek != true)
+                {
+                    throw new HttpRequestException(
+                        "The request content cannot be replayed for a 307 or 308 redirect.");
+                }
+
+                contentStream.Position = initialPosition;
+            }
+
             SimpleHttpResponse response = await SendOnceAsync(
                 method,
                 uri,
-                body,
-                contentType,
+                sendContent ? content : null,
+                sendContent ? contentStream : null,
                 cancellationToken);
+            contentSent |= sendContent;
 
             if (!_options.AllowAutoRedirect ||
                 !IsRedirect(response.StatusCode) ||
@@ -84,7 +106,7 @@ public class SimpleHttpClient
                 (response.StatusCode is 301 or 302 && method.Equals("POST", StringComparison.OrdinalIgnoreCase)))
             {
                 method = "GET";
-                body = null;
+                sendContent = false;
             }
         }
     }
@@ -92,8 +114,8 @@ public class SimpleHttpClient
     private static async Task<SimpleHttpResponse> SendOnceAsync(
         string method,
         Uri uri,
-        string? body,
-        string contentType,
+        HttpContent? content,
+        Stream? contentStream,
         CancellationToken cancellationToken)
     {
         if (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps)
@@ -106,7 +128,7 @@ public class SimpleHttpClient
         {
             await client.ConnectAsync(uri.Host, uri.Port, cancellationToken);
             stream = await GetStreamAsync(client, uri.Host, uri.Scheme == Uri.UriSchemeHttps);
-            await WriteRequestAsync(stream, method, uri, body, contentType, cancellationToken);
+            await WriteRequestAsync(stream, method, uri, content, contentStream, cancellationToken);
 
             var (statusCode, reasonPhrase, headers) =
                 await ReadResponseHeadersAsync(stream, cancellationToken);
@@ -128,26 +150,66 @@ public class SimpleHttpClient
         Stream stream,
         string method,
         Uri uri,
-        string? body,
-        string contentType,
+        HttpContent? content,
+        Stream? contentStream,
         CancellationToken cancellationToken)
     {
-        byte[]? bodyBytes = body is null ? null : Encoding.UTF8.GetBytes(body);
         string host = uri.IsDefaultPort ? uri.Host : $"{uri.Host}:{uri.Port}";
+        long? contentLength = content?.Headers.ContentLength;
+        if (contentLength is null && contentStream?.CanSeek == true)
+            contentLength = contentStream.Length - contentStream.Position;
 
         var request = new StringBuilder();
         request.Append($"{method} {uri.PathAndQuery} HTTP/1.1\r\n");
         request.Append($"Host: {host}\r\n");
-        if (bodyBytes is not null)
+        if (content is not null)
         {
-            request.Append($"Content-Type: {contentType}\r\n");
-            request.Append($"Content-Length: {bodyBytes.Length}\r\n");
+            foreach (var header in content.Headers)
+            {
+                if (!header.Key.Equals("Content-Length", StringComparison.OrdinalIgnoreCase))
+                    request.Append($"{header.Key}: {string.Join(", ", header.Value)}\r\n");
+            }
+        }
+
+        if (content is not null)
+        {
+            if (contentLength is not null)
+                request.Append($"Content-Length: {contentLength.Value}\r\n");
+            else
+                request.Append("Transfer-Encoding: chunked\r\n");
         }
         request.Append("Connection: close\r\n\r\n");
 
         await stream.WriteAsync(Encoding.ASCII.GetBytes(request.ToString()), cancellationToken);
-        if (bodyBytes is not null)
-            await stream.WriteAsync(bodyBytes, cancellationToken);
+        if (contentStream is null)
+            return;
+
+        if (contentLength is not null)
+            await contentStream.CopyToAsync(stream, cancellationToken);
+        else
+            await CopyAsChunkedAsync(contentStream, stream, cancellationToken);
+    }
+
+    private static async Task CopyAsChunkedAsync(
+        Stream source,
+        Stream destination,
+        CancellationToken cancellationToken)
+    {
+        byte[] buffer = new byte[81920];
+        while (true)
+        {
+            int read = await source.ReadAsync(buffer, cancellationToken);
+            if (read == 0)
+                break;
+
+            await destination.WriteAsync(
+                Encoding.ASCII.GetBytes($"{read:X}\r\n"),
+                cancellationToken);
+            await destination.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
+            await destination.WriteAsync("\r\n"u8.ToArray(), cancellationToken);
+        }
+
+        await destination.WriteAsync("0\r\n\r\n"u8.ToArray(), cancellationToken);
     }
 
     private static async Task<(int StatusCode, string ReasonPhrase, Dictionary<string, string> Headers)>
