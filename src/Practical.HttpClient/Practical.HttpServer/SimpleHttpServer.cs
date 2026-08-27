@@ -19,6 +19,8 @@ public sealed class SimpleHttpServer(IPAddress address, int port)
 
     private readonly TcpListener _listener = new(address, port);
 
+    public Func<SimpleHttpContext, CancellationToken, Task>? RequestHandler { get; set; }
+
     public async Task RunAsync(CancellationToken cancellationToken = default)
     {
         _listener.Start();
@@ -46,7 +48,7 @@ public sealed class SimpleHttpServer(IPAddress address, int port)
         }
     }
 
-    private static async Task HandleClientSafelyAsync(TcpClient client, CancellationToken cancellationToken)
+    private async Task HandleClientSafelyAsync(TcpClient client, CancellationToken cancellationToken)
     {
         using (client)
         {
@@ -65,7 +67,7 @@ public sealed class SimpleHttpServer(IPAddress address, int port)
         }
     }
 
-    private static async Task HandleClientAsync(TcpClient client, CancellationToken cancellationToken)
+    private async Task HandleClientAsync(TcpClient client, CancellationToken cancellationToken)
     {
         await using NetworkStream stream = client.GetStream();
         string? rawHeaders;
@@ -127,10 +129,10 @@ public sealed class SimpleHttpServer(IPAddress address, int port)
         Stream requestBody = contentLength == 0
             ? Stream.Null
             : new ContentLengthReadStream(stream, contentLength);
-        request.SetBody(requestBody);
+        request.SetContent(requestBody);
 
         var remoteEndPoint = client.Client.RemoteEndPoint as IPEndPoint;
-        var response = new ClientInformation(
+        var clientInformation = new ClientInformation(
             request.Method,
             request.Headers.Host ?? string.Empty,
             remoteEndPoint?.Address.ToString() ?? string.Empty,
@@ -138,9 +140,13 @@ public sealed class SimpleHttpServer(IPAddress address, int port)
             request.QueryString,
             request.Headers,
             request.Content.Length ?? 0);
+        var context = new SimpleHttpContext(request, new SimpleHttpResponse(stream));
 
         if (request.Headers.ContainsToken("Expect", "100-continue") && contentLength > 0)
             await stream.WriteAsync("HTTP/1.1 100 Continue\r\n\r\n"u8.ToArray(), cancellationToken);
+
+        if (RequestHandler is not null)
+            await RequestHandler(context, cancellationToken);
 
         try
         {
@@ -148,11 +154,17 @@ public sealed class SimpleHttpServer(IPAddress address, int port)
         }
         catch (EndOfStreamException exception)
         {
+            if (context.Response.HasStarted)
+                throw;
+
             await WriteErrorAsync(stream, 400, "Bad Request", exception.Message, cancellationToken);
             return;
         }
 
-        await WriteJsonResponseAsync(stream, 200, "OK", response, cancellationToken);
+        if (RequestHandler is null)
+            await WriteJsonAsync(context.Response, clientInformation, cancellationToken);
+
+        await context.Response.CompleteAsync(cancellationToken);
     }
 
     private static bool IsWebSocketAttempt(SimpleHttpHeaders headers) =>
@@ -420,34 +432,30 @@ public sealed class SimpleHttpServer(IPAddress address, int port)
         CancellationToken cancellationToken,
         string additionalHeaders = "")
     {
-        await WriteJsonResponseAsync(
-            stream,
-            statusCode,
-            reasonPhrase,
-            new { error = message },
-            cancellationToken,
-            additionalHeaders);
+        var response = new SimpleHttpResponse(stream)
+        {
+            StatusCode = statusCode,
+            ReasonPhrase = reasonPhrase
+        };
+
+        foreach (string header in additionalHeaders.Split("\r\n", StringSplitOptions.RemoveEmptyEntries))
+        {
+            int separator = header.IndexOf(':');
+            if (separator > 0)
+                response.Headers[header[..separator].Trim()] = header[(separator + 1)..].Trim();
+        }
+
+        await WriteJsonAsync(response, new { error = message }, cancellationToken);
+        await response.CompleteAsync(cancellationToken);
     }
 
-    private static async Task WriteJsonResponseAsync<T>(
-        NetworkStream stream,
-        int statusCode,
-        string reasonPhrase,
+    private static async Task WriteJsonAsync<T>(
+        SimpleHttpResponse response,
         T body,
-        CancellationToken cancellationToken,
-        string additionalHeaders = "")
+        CancellationToken cancellationToken)
     {
-        string headers =
-            $"HTTP/1.1 {statusCode} {reasonPhrase}\r\n" +
-            "Content-Type: application/json; charset=utf-8\r\n" +
-            "Transfer-Encoding: chunked\r\n" +
-            additionalHeaders +
-            "Connection: close\r\n\r\n";
-
-        await stream.WriteAsync(Encoding.ASCII.GetBytes(headers), cancellationToken);
-        var content = new ChunkedWriteStream(stream);
-        await JsonSerializer.SerializeAsync(content, body, JsonOptions, cancellationToken);
-        await content.CompleteAsync(cancellationToken);
+        response.Headers["Content-Type"] = "application/json; charset=utf-8";
+        await JsonSerializer.SerializeAsync(response.Body, body, JsonOptions, cancellationToken);
     }
 
     private static readonly JsonSerializerOptions JsonOptions = new()
