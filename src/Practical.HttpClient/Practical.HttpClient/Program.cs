@@ -13,14 +13,15 @@ foreach (var header in response.Headers)
 {
     Console.WriteLine($"{header.Key}: {header.Value}");
 }
-Console.WriteLine(await response.ReadAsStringAsync());
+Console.WriteLine($"Content-Type: {response.Content.Headers.ContentType}");
+Console.WriteLine(await response.Content.ReadAsStringAsync());
 
 await using var response2 = await client.GetAsync("https://github.com/phongnguyend/CryptographyHelper/archive/refs/tags/releases/v4.0.0.zip");
 foreach (var header in response2.Headers)
 {
     Console.WriteLine($"{header.Key}: {header.Value}");
 }
-await response2.SaveContentToFileAsync("CryptographyHelper.zip");
+await response2.Content.SaveToFileAsync("CryptographyHelper.zip");
 
 Console.WriteLine();
 
@@ -30,10 +31,10 @@ fileContent.Headers.ContentType = MediaTypeHeaderValue.Parse("multipart/form-dat
 form.Add(fileContent, "file", "abc.txt");
 form.Add(new StringContent("Test Name"), "name");
 
-var response3 = await client.PostAsync($"http://localhost:8000/convert", form);
+await using var response3 = await client.PostAsync($"http://localhost:8000/convert", form);
 foreach (var header in response3.Headers)
 {
     Console.WriteLine($"{header.Key}: {header.Value}");
 }
-Console.WriteLine(await response3.ReadAsStringAsync());
+Console.WriteLine(await response3.Content.ReadAsStringAsync());
 

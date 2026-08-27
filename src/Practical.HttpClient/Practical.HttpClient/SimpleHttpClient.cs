@@ -80,11 +80,12 @@ public class SimpleHttpClient
 
             if (!_options.AllowAutoRedirect ||
                 !IsRedirect(response.StatusCode) ||
-                !response.Headers.TryGetValue("Location", out string? location))
+                !response.Headers.ContainsKey("Location"))
             {
                 return response;
             }
 
+            Uri? location = response.Headers.Location;
             await response.DisposeAsync();
 
             if (redirectCount >= _options.MaxAutomaticRedirections)
@@ -95,11 +96,15 @@ public class SimpleHttpClient
 
             try
             {
-                uri = new Uri(uri, location);
+                uri = location is not null
+                    ? new Uri(uri, location)
+                    : throw new UriFormatException();
             }
             catch (UriFormatException exception)
             {
-                throw new HttpRequestException($"The server returned an invalid redirect location: {location}", exception);
+                throw new HttpRequestException(
+                    $"The server returned an invalid redirect location: {response.Headers["Location"]}",
+                    exception);
             }
 
             if (response.StatusCode == 303 ||
