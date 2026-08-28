@@ -97,6 +97,27 @@ public sealed class SimpleHttpResponse
         await JsonSerializer.SerializeAsync(Body, value, options, cancellationToken);
     }
 
+    internal async Task WriteErrorAsync(
+        int statusCode,
+        string reasonPhrase,
+        string message,
+        CancellationToken cancellationToken,
+        string additionalHeaders = "")
+    {
+        StatusCode = statusCode;
+        ReasonPhrase = reasonPhrase;
+
+        foreach (string header in additionalHeaders.Split("\r\n", StringSplitOptions.RemoveEmptyEntries))
+        {
+            int separator = header.IndexOf(':');
+            if (separator > 0)
+                Headers[header[..separator].Trim()] = header[(separator + 1)..].Trim();
+        }
+
+        await WriteJsonAsync(new { error = message }, cancellationToken);
+        await CompleteAsync(cancellationToken);
+    }
+
     private void EnsureNotStarted()
     {
         if (HasStarted)

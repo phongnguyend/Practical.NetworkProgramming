@@ -44,6 +44,7 @@ server.MapWebSocket("/ws", async (context, cancellationToken) =>
         endOfMessage: true,
         cancellationToken);
 });
+
 Console.WriteLine($"HTTP server listening on http://localhost:{port}/");
 Console.WriteLine($"WebSocket echo endpoint: ws://localhost:{port}/ws");
 Console.WriteLine("Press Ctrl+C to stop.");

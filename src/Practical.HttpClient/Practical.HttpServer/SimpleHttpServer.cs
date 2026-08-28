@@ -101,6 +101,7 @@ public sealed class SimpleHttpServer
     private async Task HandleClientAsync(TcpClient client, CancellationToken cancellationToken)
     {
         await using NetworkStream stream = client.GetStream();
+        var response = new SimpleHttpResponse(stream);
         string? rawHeaders;
 
         try
@@ -109,7 +110,7 @@ public sealed class SimpleHttpServer
         }
         catch (InvalidDataException exception)
         {
-            await WriteErrorAsync(stream, 431, "Request Header Fields Too Large", exception.Message, cancellationToken);
+            await response.WriteErrorAsync(431, "Request Header Fields Too Large", exception.Message, cancellationToken);
             return;
         }
 
@@ -118,7 +119,7 @@ public sealed class SimpleHttpServer
 
         if (!TryParseRequest(rawHeaders, out var request, out string error))
         {
-            await WriteErrorAsync(stream, 400, "Bad Request", error, cancellationToken);
+            await response.WriteErrorAsync(400, "Bad Request", error, cancellationToken);
             return;
         }
 
@@ -126,8 +127,7 @@ public sealed class SimpleHttpServer
         {
             if (!TryGetWebSocketHandler(request.Path, out var webSocketHandler))
             {
-                await WriteErrorAsync(
-                    stream,
+                await response.WriteErrorAsync(
                     404,
                     "Not Found",
                     $"No WebSocket handler is mapped to '{request.Path}'.",
@@ -138,6 +138,7 @@ public sealed class SimpleHttpServer
             await HandleWebSocketUpgradeAsync(
                 client.Client,
                 stream,
+                response,
                 request,
                 webSocketHandler,
                 cancellationToken);
@@ -147,8 +148,7 @@ public sealed class SimpleHttpServer
         if (!_options.AllowedMethods.Contains(request.Method, StringComparer.OrdinalIgnoreCase))
         {
             string allowedMethods = string.Join(", ", _options.AllowedMethods);
-            await WriteErrorAsync(
-                stream,
+            await response.WriteErrorAsync(
                 405,
                 "Method Not Allowed",
                 $"Only {allowedMethods} are supported.",
@@ -159,14 +159,13 @@ public sealed class SimpleHttpServer
 
         if (!request.Headers.TryGetContentLength(out int contentLength, out error))
         {
-            await WriteErrorAsync(stream, 400, "Bad Request", error, cancellationToken);
+            await response.WriteErrorAsync(400, "Bad Request", error, cancellationToken);
             return;
         }
 
         if (contentLength > _options.MaximumRequestBodySize)
         {
-            await WriteErrorAsync(
-                stream,
+            await response.WriteErrorAsync(
                 413,
                 "Content Too Large",
                 $"The request body cannot exceed {_options.MaximumRequestBodySize} bytes.",
@@ -182,7 +181,7 @@ public sealed class SimpleHttpServer
         var context = new SimpleHttpContext(
             client.Client,
             request,
-            new SimpleHttpResponse(stream));
+            response);
 
         if (request.Headers.ContainsToken("Expect", "100-continue") && contentLength > 0)
             await stream.WriteAsync("HTTP/1.1 100 Continue\r\n\r\n"u8.ToArray(), cancellationToken);
@@ -198,7 +197,7 @@ public sealed class SimpleHttpServer
             if (context.Response.HasStarted)
                 throw;
 
-            await WriteErrorAsync(stream, 400, "Bad Request", exception.Message, cancellationToken);
+            await response.WriteErrorAsync(400, "Bad Request", exception.Message, cancellationToken);
             return;
         }
 
@@ -208,14 +207,14 @@ public sealed class SimpleHttpServer
     private async Task HandleWebSocketUpgradeAsync(
         Socket socket,
         NetworkStream stream,
+        SimpleHttpResponse response,
         SimpleHttpRequest request,
         Func<SimpleWebSocketContext, CancellationToken, Task> webSocketHandler,
         CancellationToken cancellationToken)
     {
         if (request.Method != "GET" || request.Version != "HTTP/1.1")
         {
-            await WriteErrorAsync(
-                stream,
+            await response.WriteErrorAsync(
                 400,
                 "Bad Request",
                 "A WebSocket upgrade requires GET and HTTP/1.1.",
@@ -226,8 +225,7 @@ public sealed class SimpleHttpServer
         if (!request.Headers.ContainsToken("Connection", "Upgrade") ||
             !request.Headers.ContainsToken("Upgrade", "websocket"))
         {
-            await WriteErrorAsync(
-                stream,
+            await response.WriteErrorAsync(
                 400,
                 "Bad Request",
                 "Connection: Upgrade and Upgrade: websocket headers are required.",
@@ -237,8 +235,7 @@ public sealed class SimpleHttpServer
 
         if (request.Headers.WebSocketVersion != "13")
         {
-            await WriteErrorAsync(
-                stream,
+            await response.WriteErrorAsync(
                 426,
                 "Upgrade Required",
                 "Only WebSocket version 13 is supported.",
@@ -249,8 +246,7 @@ public sealed class SimpleHttpServer
 
         if (request.Headers.WebSocketKey is not string key || !IsValidWebSocketKey(key))
         {
-            await WriteErrorAsync(
-                stream,
+            await response.WriteErrorAsync(
                 400,
                 "Bad Request",
                 "Sec-WebSocket-Key must be a Base64-encoded 16-byte value.",
@@ -260,13 +256,13 @@ public sealed class SimpleHttpServer
 
         string accept = Convert.ToBase64String(
             SHA1.HashData(Encoding.ASCII.GetBytes(key.Trim() + WebSocketGuid)));
-        string response =
+        string handshakeResponse =
             "HTTP/1.1 101 Switching Protocols\r\n" +
             "Upgrade: websocket\r\n" +
             "Connection: Upgrade\r\n" +
             $"Sec-WebSocket-Accept: {accept}\r\n\r\n";
 
-        await stream.WriteAsync(Encoding.ASCII.GetBytes(response), cancellationToken);
+        await stream.WriteAsync(Encoding.ASCII.GetBytes(handshakeResponse), cancellationToken);
 
         using WebSocket webSocket = WebSocket.CreateFromStream(
             stream,
@@ -447,28 +443,4 @@ public sealed class SimpleHttpServer
         return true;
     }
 
-    private static async Task WriteErrorAsync(
-        NetworkStream stream,
-        int statusCode,
-        string reasonPhrase,
-        string message,
-        CancellationToken cancellationToken,
-        string additionalHeaders = "")
-    {
-        var response = new SimpleHttpResponse(stream)
-        {
-            StatusCode = statusCode,
-            ReasonPhrase = reasonPhrase
-        };
-
-        foreach (string header in additionalHeaders.Split("\r\n", StringSplitOptions.RemoveEmptyEntries))
-        {
-            int separator = header.IndexOf(':');
-            if (separator > 0)
-                response.Headers[header[..separator].Trim()] = header[(separator + 1)..].Trim();
-        }
-
-        await response.WriteJsonAsync(new { error = message }, cancellationToken);
-        await response.CompleteAsync(cancellationToken);
-    }
 }
