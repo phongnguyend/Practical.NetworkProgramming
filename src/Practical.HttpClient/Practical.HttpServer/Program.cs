@@ -16,7 +16,25 @@ Console.CancelKeyPress += (_, eventArgs) =>
     cancellation.Cancel();
 };
 
-var server = new SimpleHttpServer(IPAddress.Any, port);
+var server = new SimpleHttpServer(IPAddress.Any, port)
+{
+    RequestHandler = (context, cancellationToken) =>
+    {
+        var remoteEndPoint = context.Socket.RemoteEndPoint as IPEndPoint;
+        var clientInformation = new
+        {
+            context.Request.Method,
+            Host = context.Request.Headers.Host ?? string.Empty,
+            Ip = remoteEndPoint?.Address.ToString() ?? string.Empty,
+            context.Request.Path,
+            context.Request.QueryString,
+            context.Request.Headers,
+            BodyLength = context.Request.Content.Length ?? 0
+        };
+
+        return context.Response.WriteJsonAsync(clientInformation, cancellationToken);
+    }
+};
 Console.WriteLine($"HTTP server listening on http://localhost:{port}/");
 Console.WriteLine($"WebSocket echo endpoint: ws://localhost:{port}/ws");
 Console.WriteLine("Press Ctrl+C to stop.");

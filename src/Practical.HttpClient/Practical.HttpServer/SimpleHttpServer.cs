@@ -6,18 +6,26 @@ using System.Text;
 
 namespace Practical.HttpServer;
 
-public sealed class SimpleHttpServer(IPAddress address, int port)
+public sealed class SimpleHttpServer
 {
-    private const int MaximumHeaderSize = 64 * 1024;
-    private const int MaximumBodySize = 10 * 1024 * 1024;
-    private const int MaximumWebSocketMessageSize = 1024 * 1024;
     private const string WebSocketGuid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-    private static readonly HashSet<string> AllowedMethods =
-        new(StringComparer.Ordinal) { "GET", "POST", "PUT", "DELETE" };
+    private readonly SimpleHttpServerOptions _options;
+    private readonly TcpListener _listener;
 
-    private readonly TcpListener _listener = new(address, port);
+    public SimpleHttpServer(
+        IPAddress address,
+        int port,
+        SimpleHttpServerOptions? options = null)
+    {
+        ArgumentNullException.ThrowIfNull(address);
+        _options = options ?? new SimpleHttpServerOptions();
+        ArgumentNullException.ThrowIfNull(_options.AllowedMethods);
+        if (_options.AllowedMethods.Count == 0 || _options.AllowedMethods.Any(string.IsNullOrWhiteSpace))
+            throw new ArgumentException("At least one valid HTTP method must be allowed.", nameof(options));
+        _listener = new TcpListener(address, port);
+    }
 
-    public Func<SimpleHttpContext, CancellationToken, Task>? RequestHandler { get; set; }
+    public required Func<SimpleHttpContext, CancellationToken, Task> RequestHandler { get; set; }
 
     public async Task RunAsync(CancellationToken cancellationToken = default)
     {
@@ -95,15 +103,16 @@ public sealed class SimpleHttpServer(IPAddress address, int port)
             return;
         }
 
-        if (!AllowedMethods.Contains(request.Method))
+        if (!_options.AllowedMethods.Contains(request.Method, StringComparer.OrdinalIgnoreCase))
         {
+            string allowedMethods = string.Join(", ", _options.AllowedMethods);
             await WriteErrorAsync(
                 stream,
                 405,
                 "Method Not Allowed",
-                "Only GET, POST, PUT, and DELETE are supported.",
+                $"Only {allowedMethods} are supported.",
                 cancellationToken,
-                "Allow: GET, POST, PUT, DELETE\r\n");
+                $"Allow: {allowedMethods}\r\n");
             return;
         }
 
@@ -113,13 +122,13 @@ public sealed class SimpleHttpServer(IPAddress address, int port)
             return;
         }
 
-        if (contentLength > MaximumBodySize)
+        if (contentLength > _options.MaximumRequestBodySize)
         {
             await WriteErrorAsync(
                 stream,
                 413,
                 "Content Too Large",
-                $"The request body cannot exceed {MaximumBodySize} bytes.",
+                $"The request body cannot exceed {_options.MaximumRequestBodySize} bytes.",
                 cancellationToken);
             return;
         }
@@ -129,26 +138,19 @@ public sealed class SimpleHttpServer(IPAddress address, int port)
             : new ContentLengthReadStream(stream, contentLength);
         request.SetContent(requestBody);
 
-        var remoteEndPoint = client.Client.RemoteEndPoint as IPEndPoint;
-        var clientInformation = new ClientInformation(
-            request.Method,
-            request.Headers.Host ?? string.Empty,
-            remoteEndPoint?.Address.ToString() ?? string.Empty,
-            request.Path,
-            request.QueryString,
-            request.Headers,
-            request.Content.Length ?? 0);
-        var context = new SimpleHttpContext(request, new SimpleHttpResponse(stream));
+        var context = new SimpleHttpContext(
+            client.Client,
+            request,
+            new SimpleHttpResponse(stream));
 
         if (request.Headers.ContainsToken("Expect", "100-continue") && contentLength > 0)
             await stream.WriteAsync("HTTP/1.1 100 Continue\r\n\r\n"u8.ToArray(), cancellationToken);
 
-        if (RequestHandler is not null)
-            await RequestHandler(context, cancellationToken);
+        await RequestHandler(context, cancellationToken);
 
         try
         {
-            await request.Content.CopyToAsync(Stream.Null, cancellationToken);
+            await request.Content.DrainAsync(cancellationToken);
         }
         catch (EndOfStreamException exception)
         {
@@ -159,20 +161,22 @@ public sealed class SimpleHttpServer(IPAddress address, int port)
             return;
         }
 
-        if (RequestHandler is null)
-            await context.Response.WriteJsonAsync(clientInformation, cancellationToken);
-
         await context.Response.CompleteAsync(cancellationToken);
     }
 
-    private static async Task HandleWebSocketUpgradeAsync(
+    private async Task HandleWebSocketUpgradeAsync(
         NetworkStream stream,
         SimpleHttpRequest request,
         CancellationToken cancellationToken)
     {
-        if (request.Path != "/ws")
+        if (request.Path != _options.WebSocketPath)
         {
-            await WriteErrorAsync(stream, 404, "Not Found", "The WebSocket endpoint is /ws.", cancellationToken);
+            await WriteErrorAsync(
+                stream,
+                404,
+                "Not Found",
+                $"The WebSocket endpoint is {_options.WebSocketPath}.",
+                cancellationToken);
             return;
         }
 
@@ -236,7 +240,7 @@ public sealed class SimpleHttpServer(IPAddress address, int port)
             stream,
             isServer: true,
             subProtocol: null,
-            keepAliveInterval: TimeSpan.FromSeconds(30));
+            keepAliveInterval: _options.WebSocketKeepAliveInterval);
 
         await RunWebSocketEchoLoopAsync(webSocket, cancellationToken);
     }
@@ -253,7 +257,7 @@ public sealed class SimpleHttpServer(IPAddress address, int port)
         }
     }
 
-    private static async Task RunWebSocketEchoLoopAsync(
+    private async Task RunWebSocketEchoLoopAsync(
         WebSocket webSocket,
         CancellationToken cancellationToken)
     {
@@ -279,11 +283,11 @@ public sealed class SimpleHttpServer(IPAddress address, int port)
                         return;
                     }
 
-                    if (message.Length + result.Count > MaximumWebSocketMessageSize)
+                    if (message.Length + result.Count > _options.MaximumWebSocketMessageSize)
                     {
                         await webSocket.CloseOutputAsync(
                             WebSocketCloseStatus.MessageTooBig,
-                            $"Messages cannot exceed {MaximumWebSocketMessageSize} bytes.",
+                            $"Messages cannot exceed {_options.MaximumWebSocketMessageSize} bytes.",
                             cancellationToken);
                         return;
                     }
@@ -305,14 +309,14 @@ public sealed class SimpleHttpServer(IPAddress address, int port)
         }
     }
 
-    private static async Task<string?> ReadHeadersAsync(NetworkStream stream, CancellationToken cancellationToken)
+    private async Task<string?> ReadHeadersAsync(NetworkStream stream, CancellationToken cancellationToken)
     {
         var bytes = new List<byte>();
         var singleByte = new byte[1];
         var terminator = new byte[] { 13, 10, 13, 10 };
         var matched = 0;
 
-        while (bytes.Count < MaximumHeaderSize)
+        while (bytes.Count < _options.MaximumRequestHeaderSize)
         {
             int read = await stream.ReadAsync(singleByte, cancellationToken);
             if (read == 0)
@@ -333,7 +337,8 @@ public sealed class SimpleHttpServer(IPAddress address, int port)
             }
         }
 
-        throw new InvalidDataException($"Request headers cannot exceed {MaximumHeaderSize} bytes.");
+        throw new InvalidDataException(
+            $"Request headers cannot exceed {_options.MaximumRequestHeaderSize} bytes.");
     }
 
     private static bool TryParseRequest(string rawHeaders, out SimpleHttpRequest request, out string error)
@@ -416,13 +421,4 @@ public sealed class SimpleHttpServer(IPAddress address, int port)
         await response.WriteJsonAsync(new { error = message }, cancellationToken);
         await response.CompleteAsync(cancellationToken);
     }
-
-    private sealed record ClientInformation(
-        string Method,
-        string Host,
-        string Ip,
-        string Path,
-        string QueryString,
-        IReadOnlyDictionary<string, string> Headers,
-        long BodyLength);
 }

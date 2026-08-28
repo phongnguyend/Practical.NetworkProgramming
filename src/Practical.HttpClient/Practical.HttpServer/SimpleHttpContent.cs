@@ -43,4 +43,7 @@ public sealed class SimpleHttpContent
         ArgumentNullException.ThrowIfNull(destination);
         await _body.CopyToAsync(destination, cancellationToken);
     }
+
+    public Task DrainAsync(CancellationToken cancellationToken = default) =>
+        CopyToAsync(Stream.Null, cancellationToken);
 }
