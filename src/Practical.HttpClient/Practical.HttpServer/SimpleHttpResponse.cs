@@ -1,5 +1,7 @@
 using System.Net.Sockets;
 using System.Text;
+using System.Text.Encodings.Web;
+using System.Text.Json;
 
 namespace Practical.HttpServer;
 
@@ -79,11 +81,34 @@ public sealed class SimpleHttpResponse
         await _chunkedStream.CompleteAsync(cancellationToken);
     }
 
+    public Task WriteJsonAsync<T>(
+        T value,
+        CancellationToken cancellationToken = default) =>
+        WriteJsonAsync(value, DefaultJsonOptions, cancellationToken);
+
+    public async Task WriteJsonAsync<T>(
+        T value,
+        JsonSerializerOptions options,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        EnsureNotStarted();
+        Headers["Content-Type"] = "application/json; charset=utf-8";
+        await JsonSerializer.SerializeAsync(Body, value, options, cancellationToken);
+    }
+
     private void EnsureNotStarted()
     {
         if (HasStarted)
             throw new InvalidOperationException("The response has already started.");
     }
+
+    private static readonly JsonSerializerOptions DefaultJsonOptions = new()
+    {
+        Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        WriteIndented = true
+    };
 
     private sealed class ResponseBodyStream(SimpleHttpResponse response) : Stream
     {

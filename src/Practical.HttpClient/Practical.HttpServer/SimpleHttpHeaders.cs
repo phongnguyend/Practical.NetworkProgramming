@@ -70,6 +70,33 @@ public sealed class SimpleHttpHeaders : IReadOnlyDictionary<string, string>
         _headers.TryGetValue(name, out string? value) &&
         value.Split(',').Any(part => part.Trim().Equals(token, StringComparison.OrdinalIgnoreCase));
 
+    public bool IsWebSocketAttempt() =>
+        ContainsToken("Upgrade", "websocket") || WebSocketKey is not null;
+
+    public bool TryGetContentLength(out int contentLength, out string error)
+    {
+        contentLength = 0;
+        error = string.Empty;
+
+        if (TransferEncoding.Count > 0)
+        {
+            error = "Transfer-Encoding is not supported; send a Content-Length header instead.";
+            return false;
+        }
+
+        if (!ContainsKey("Content-Length"))
+            return true;
+
+        if (ContentLength is not long parsedContentLength || parsedContentLength > int.MaxValue)
+        {
+            error = "Content-Length must be a non-negative integer.";
+            return false;
+        }
+
+        contentLength = (int)parsedContentLength;
+        return true;
+    }
+
     private string? GetValueOrDefault(string name) =>
         _headers.TryGetValue(name, out string? value) ? value : null;
 

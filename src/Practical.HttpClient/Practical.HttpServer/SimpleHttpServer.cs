@@ -3,8 +3,6 @@ using System.Net.Sockets;
 using System.Net.WebSockets;
 using System.Security.Cryptography;
 using System.Text;
-using System.Text.Encodings.Web;
-using System.Text.Json;
 
 namespace Practical.HttpServer;
 
@@ -91,7 +89,7 @@ public sealed class SimpleHttpServer(IPAddress address, int port)
             return;
         }
 
-        if (IsWebSocketAttempt(request.Headers))
+        if (request.Headers.IsWebSocketAttempt())
         {
             await HandleWebSocketUpgradeAsync(stream, request, cancellationToken);
             return;
@@ -109,7 +107,7 @@ public sealed class SimpleHttpServer(IPAddress address, int port)
             return;
         }
 
-        if (!TryGetContentLength(request.Headers, out int contentLength, out error))
+        if (!request.Headers.TryGetContentLength(out int contentLength, out error))
         {
             await WriteErrorAsync(stream, 400, "Bad Request", error, cancellationToken);
             return;
@@ -162,13 +160,10 @@ public sealed class SimpleHttpServer(IPAddress address, int port)
         }
 
         if (RequestHandler is null)
-            await WriteJsonAsync(context.Response, clientInformation, cancellationToken);
+            await context.Response.WriteJsonAsync(clientInformation, cancellationToken);
 
         await context.Response.CompleteAsync(cancellationToken);
     }
-
-    private static bool IsWebSocketAttempt(SimpleHttpHeaders headers) =>
-        headers.ContainsToken("Upgrade", "websocket") || headers.WebSocketKey is not null;
 
     private static async Task HandleWebSocketUpgradeAsync(
         NetworkStream stream,
@@ -397,33 +392,6 @@ public sealed class SimpleHttpServer(IPAddress address, int port)
         return true;
     }
 
-    private static bool TryGetContentLength(
-        SimpleHttpHeaders headers,
-        out int contentLength,
-        out string error)
-    {
-        contentLength = 0;
-        error = string.Empty;
-
-        if (headers.TransferEncoding.Count > 0)
-        {
-            error = "Transfer-Encoding is not supported; send a Content-Length header instead.";
-            return false;
-        }
-
-        if (!headers.ContainsKey("Content-Length"))
-            return true;
-
-        if (headers.ContentLength is not long parsedContentLength || parsedContentLength > int.MaxValue)
-        {
-            error = "Content-Length must be a non-negative integer.";
-            return false;
-        }
-
-        contentLength = (int)parsedContentLength;
-        return true;
-    }
-
     private static async Task WriteErrorAsync(
         NetworkStream stream,
         int statusCode,
@@ -445,25 +413,9 @@ public sealed class SimpleHttpServer(IPAddress address, int port)
                 response.Headers[header[..separator].Trim()] = header[(separator + 1)..].Trim();
         }
 
-        await WriteJsonAsync(response, new { error = message }, cancellationToken);
+        await response.WriteJsonAsync(new { error = message }, cancellationToken);
         await response.CompleteAsync(cancellationToken);
     }
-
-    private static async Task WriteJsonAsync<T>(
-        SimpleHttpResponse response,
-        T body,
-        CancellationToken cancellationToken)
-    {
-        response.Headers["Content-Type"] = "application/json; charset=utf-8";
-        await JsonSerializer.SerializeAsync(response.Body, body, JsonOptions, cancellationToken);
-    }
-
-    private static readonly JsonSerializerOptions JsonOptions = new()
-    {
-        Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
-        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-        WriteIndented = true
-    };
 
     private sealed record ClientInformation(
         string Method,
