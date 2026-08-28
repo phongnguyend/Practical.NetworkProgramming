@@ -6,7 +6,6 @@ public sealed class SimpleHttpServerOptions
     private int _maximumRequestBodySize = 10 * 1024 * 1024;
     private int _maximumWebSocketMessageSize = 1024 * 1024;
     private TimeSpan _webSocketKeepAliveInterval = TimeSpan.FromSeconds(30);
-    private string _webSocketPath = "/ws";
 
     public int MaximumRequestHeaderSize
     {
@@ -30,18 +29,6 @@ public sealed class SimpleHttpServerOptions
 
     public IReadOnlyCollection<string> AllowedMethods { get; init; } =
         ["GET", "POST", "PUT", "DELETE"];
-
-    public string WebSocketPath
-    {
-        get => _webSocketPath;
-        init
-        {
-            ArgumentException.ThrowIfNullOrWhiteSpace(value);
-            if (!value.StartsWith('/'))
-                throw new ArgumentException("The WebSocket path must start with '/'.", nameof(value));
-            _webSocketPath = value;
-        }
-    }
 
     public int MaximumWebSocketMessageSize
     {

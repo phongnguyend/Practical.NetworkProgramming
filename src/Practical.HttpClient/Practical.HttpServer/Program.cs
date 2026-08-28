@@ -35,6 +35,15 @@ var server = new SimpleHttpServer(IPAddress.Any, port)
         return context.Response.WriteJsonAsync(clientInformation, cancellationToken);
     }
 };
+
+server.MapWebSocket("/ws", async (context, cancellationToken) =>
+{
+    await context.WebSocket.SendAsync(
+        context.Message,
+        context.MessageType,
+        endOfMessage: true,
+        cancellationToken);
+});
 Console.WriteLine($"HTTP server listening on http://localhost:{port}/");
 Console.WriteLine($"WebSocket echo endpoint: ws://localhost:{port}/ws");
 Console.WriteLine("Press Ctrl+C to stop.");

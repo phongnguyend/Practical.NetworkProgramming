@@ -11,6 +11,9 @@ public sealed class SimpleHttpServer
     private const string WebSocketGuid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
     private readonly SimpleHttpServerOptions _options;
     private readonly TcpListener _listener;
+    private readonly Dictionary<string, Func<SimpleWebSocketContext, CancellationToken, Task>>
+        _webSocketHandlers = new(StringComparer.Ordinal);
+    private readonly object _webSocketHandlersLock = new();
 
     public SimpleHttpServer(
         IPAddress address,
@@ -26,6 +29,28 @@ public sealed class SimpleHttpServer
     }
 
     public required Func<SimpleHttpContext, CancellationToken, Task> RequestHandler { get; set; }
+
+    public SimpleHttpServer MapWebSocket(
+        string path,
+        Func<SimpleWebSocketContext, CancellationToken, Task> handler)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(path);
+        ArgumentNullException.ThrowIfNull(handler);
+        if (!path.StartsWith('/') || path.Contains('?') || path.Contains('#'))
+        {
+            throw new ArgumentException(
+                "A WebSocket path must start with '/' and cannot contain a query string or fragment.",
+                nameof(path));
+        }
+
+        lock (_webSocketHandlersLock)
+        {
+            if (!_webSocketHandlers.TryAdd(path, handler))
+                throw new InvalidOperationException($"A WebSocket handler is already mapped to '{path}'.");
+        }
+
+        return this;
+    }
 
     public async Task RunAsync(CancellationToken cancellationToken = default)
     {
@@ -99,7 +124,23 @@ public sealed class SimpleHttpServer
 
         if (request.Headers.IsWebSocketAttempt())
         {
-            await HandleWebSocketUpgradeAsync(stream, request, cancellationToken);
+            if (!TryGetWebSocketHandler(request.Path, out var webSocketHandler))
+            {
+                await WriteErrorAsync(
+                    stream,
+                    404,
+                    "Not Found",
+                    $"No WebSocket handler is mapped to '{request.Path}'.",
+                    cancellationToken);
+                return;
+            }
+
+            await HandleWebSocketUpgradeAsync(
+                client.Client,
+                stream,
+                request,
+                webSocketHandler,
+                cancellationToken);
             return;
         }
 
@@ -165,21 +206,12 @@ public sealed class SimpleHttpServer
     }
 
     private async Task HandleWebSocketUpgradeAsync(
+        Socket socket,
         NetworkStream stream,
         SimpleHttpRequest request,
+        Func<SimpleWebSocketContext, CancellationToken, Task> webSocketHandler,
         CancellationToken cancellationToken)
     {
-        if (request.Path != _options.WebSocketPath)
-        {
-            await WriteErrorAsync(
-                stream,
-                404,
-                "Not Found",
-                $"The WebSocket endpoint is {_options.WebSocketPath}.",
-                cancellationToken);
-            return;
-        }
-
         if (request.Method != "GET" || request.Version != "HTTP/1.1")
         {
             await WriteErrorAsync(
@@ -242,7 +274,12 @@ public sealed class SimpleHttpServer
             subProtocol: null,
             keepAliveInterval: _options.WebSocketKeepAliveInterval);
 
-        await RunWebSocketEchoLoopAsync(webSocket, cancellationToken);
+        await RunWebSocketLoopAsync(
+            socket,
+            request,
+            webSocket,
+            webSocketHandler,
+            cancellationToken);
     }
 
     private static bool IsValidWebSocketKey(string key)
@@ -257,8 +294,11 @@ public sealed class SimpleHttpServer
         }
     }
 
-    private async Task RunWebSocketEchoLoopAsync(
+    private async Task RunWebSocketLoopAsync(
+        Socket socket,
+        SimpleHttpRequest request,
         WebSocket webSocket,
+        Func<SimpleWebSocketContext, CancellationToken, Task> webSocketHandler,
         CancellationToken cancellationToken)
     {
         var receiveBuffer = new byte[8192];
@@ -296,17 +336,27 @@ public sealed class SimpleHttpServer
                 }
                 while (!result.EndOfMessage);
 
-                await webSocket.SendAsync(
+                var context = new SimpleWebSocketContext(
+                    socket,
+                    request,
+                    webSocket,
                     message.GetBuffer().AsMemory(0, checked((int)message.Length)),
-                    result.MessageType,
-                    endOfMessage: true,
-                    cancellationToken);
+                    result.MessageType);
+                await webSocketHandler(context, cancellationToken);
             }
         }
         catch (WebSocketException)
         {
             // The peer disconnected without completing the close handshake.
         }
+    }
+
+    private bool TryGetWebSocketHandler(
+        string path,
+        out Func<SimpleWebSocketContext, CancellationToken, Task> handler)
+    {
+        lock (_webSocketHandlersLock)
+            return _webSocketHandlers.TryGetValue(path, out handler!);
     }
 
     private async Task<string?> ReadHeadersAsync(NetworkStream stream, CancellationToken cancellationToken)
